@@ -118,3 +118,111 @@ Each of the 8 steps is a card with:
   approach is already used in the codebase
 - Do not create a new state management system — use what exists
 - Do not create a new wiki loader — use the existing one
+
+
+## RAG Memory System — Solved Ticket Vector Store
+
+### On Ticket Completion
+When a ticket is marked as Complete or "Under Review" after 
+the final report is sent, automatically store the full 
+resolution in the vector DB:
+
+Document to store:
+{
+  ticketId: "AWT-001",
+  title: "original ticket title",
+  problemStatement: "extracted in Step 1",
+  rootCause: "from Step 8",
+  affectedSystem: "from Step 1",
+  sqlQueriesUsed: ["query1", "query2"],
+  logQueryUsed: "log grep pattern",
+  sqlFindings: "summary of table results",
+  logFindings: "summary of log results",
+  fixSteps: ["step1", "step2", ...],
+  wikiSourcesUsed: [{ title, url }],
+  confidenceScore: 92,
+  resolvedAt: "ISO timestamp",
+  resolvedBy: "AI Agent",
+  tags: ["portfolio", "transaction-service", "AWT"]
+}
+
+- Generate an embedding for the combined text of:
+  title + problemStatement + rootCause + tags
+- Store embedding + full document in the existing vector DB
+- Use the same vector DB client/config already in the project
+- Collection name: "resolved_incidents"
+- If collection does not exist: create it on first store
+
+### Step 4 — Historical Memory Search (RAG)
+This step now queries the "resolved_incidents" collection:
+
+- Generate embedding from current ticket's problem statement
+- Run similarity search: top 3 results with score > 0.75
+- If results found:
+  - Show each as a card:
+    [AWT-002] Portfolio NAV mismatch — resolved 3 days ago
+    Similarity: 89% | Fix: rerun portfolio calculator job
+  - Highlight the most similar one with a "Best Match" badge
+- If no results found (first time this type appears):
+  - Show: "No similar past incidents found — 
+            this resolution will be stored for future use"
+
+### Step 1 Enhancement — Memory-Aware Analysis
+After extracting the problem statement in Step 1:
+- Immediately do a quick RAG lookup (top 1 result, score > 0.85)
+- If a strong match is found:
+  - Show an "Similar incident resolved before" banner at the top
+  - Pre-fill the agent with context from the past resolution
+  - Agent can skip or fast-track steps 3-7 using cached findings
+  - Show: "Fast Track Mode — using memory from [ticket ID]"
+
+### Agent Decision Logic
+After Step 4 RAG results come in, the agent decides:
+
+If similarityScore > 0.85 (very similar):
+  → Show: "High confidence match found"
+  → Offer [Fast Track] button — skips to Step 8 using past resolution
+  → Still show all steps as "skipped with memory" in green
+
+If similarityScore 0.65-0.85 (partial match):
+  → Continue full flow but pre-populate queries in Step 5
+    with the ones that worked last time
+  → Show: "Partial match — using historical queries as base"
+
+If similarityScore < 0.65 or no match:
+  → Run full 8-step flow as normal
+  → New resolution will be stored after completion
+
+### Memory Panel (UI)
+Add a collapsible "Memory" sidebar panel on the right:
+- Shows all retrieved similar tickets from RAG
+- Each entry: ticket ID, title, similarity %, resolution summary,
+  date resolved, [View Full Resolution] button
+- A small brain/memory icon in the step 4 card header
+- After ticket is stored: show a 
+  "✓ Stored in memory" toast notification
+  at the bottom of the page
+
+### Storage Trigger
+Store to vector DB at these points:
+- When [Send Report] is clicked and status → "Under Review"
+- When ticket status → "Complete"
+- Do NOT store if the agent flow errored out or was incomplete
+- Do NOT store duplicates — check ticketId before inserting
+
+### Retrieval at Page Load
+When Investigation Board loads with a selected ticket:
+- Immediately run a background RAG search silently
+- If match found: show a subtle banner before user clicks Investigate:
+  "💡 Similar incident found in memory — 
+     investigation may be faster"
+- This gives the engineer a heads-up before starting
+
+### Use existing setup
+- Use the vector DB client already configured in the project
+- Use the same embedding model already in use
+- Follow the same collection/index naming conventions in the project
+- If no vector DB exists yet in the project: use ChromaDB with 
+  the JS client, store locally, and add a note in the code 
+  showing where to swap in a production DB
+
