@@ -1,0 +1,794 @@
+Here’s the fully updated plan with Python, frameworks allowed, and investigation board fixed:
+
+# RapidRoot — AI Incident Management System
+# Complete End-to-End Build Plan + Unit Test Coverage
+
+## Project Overview
+RapidRoot is a Python-based AI incident management system with 4 pages:
+- Page 1: Login
+- Page 2: Overview Dashboard
+- Page 3: Incidents Tab
+- Page 4: Agent Inbox / Investigation Board
+
+Backend: Python (FastAPI)
+Frontend: HTML/CSS/JS (existing style) — frameworks allowed
+Database: ChromaDB for RAG, SQLite for ticket/session storage
+All pages share one state layer and sync in real time via WebSocket.
+
+---
+
+## STEP 0 — INSTALLATION & SETUP
+
+### Python Environment
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+### Install Dependencies
+pip install fastapi
+pip install uvicorn
+pip install chromadb
+pip install sqlalchemy
+pip install python-jose[cryptography]   # session/JWT
+pip install passlib[bcrypt]             # password hashing
+pip install anthropic                   # AI model client
+pip install python-dotenv
+pip install websockets
+pip install pytest
+pip install pytest-asyncio
+pip install httpx                       # for testing FastAPI
+
+### Project Structure
+rapidroot/
+  main.py                   ← FastAPI app entry point
+  .env                      ← API keys, config (never commit)
+  requirements.txt
+  /routers
+    auth.py                 ← login/logout/session endpoints
+    tickets.py              ← ticket CRUD endpoints
+    agent.py                ← agent flow trigger endpoints
+    metrics.py              ← dashboard metrics endpoints
+    rag.py                  ← RAG store/search endpoints
+  /services
+    agent_flow.py           ← 8-step pipeline logic
+    wiki_search.py          ← EXISTING wiki loader (do not recreate)
+    rag_memory.py           ← ChromaDB read/write
+    report_builder.py       ← final report generator
+    terminal_runner.py      ← SQL/log mock execution logic
+  /models
+    ticket.py               ← SQLAlchemy ticket model
+    user.py                 ← SQLAlchemy user model
+    resolution.py           ← resolution document model
+  /db
+    database.py             ← SQLite connection + session
+    chroma.py               ← ChromaDB client init
+  /static
+    /css
+      global.css            ← shared variables, dark theme
+      login.css
+      dashboard.css
+      incidents.css
+      investigation.css
+    /js
+      state.js              ← frontend shared state
+      auth.js               ← frontend session guard
+      dashboard.js
+      incidents.js
+      investigation.js
+      agentFlow.js          ← frontend step runner (calls backend)
+      terminal.js           ← CLI visual component
+      ragMemory.js          ← frontend RAG display
+  /templates
+    login.html
+    dashboard.html
+    incidents.html
+    investigation.html
+  /tests
+    test_auth.py
+    test_tickets.py
+    test_agent_flow.py
+    test_rag_memory.py
+    test_metrics.py
+    test_investigation.py
+    test_sync.py
+    test_terminal.py
+
+### .env Template
+ANTHROPIC_API_KEY=your_key_here
+SECRET_KEY=your_jwt_secret
+DATABASE_URL=sqlite:///./rapidroot.db
+CHROMA_PERSIST_DIR=./chromadb
+WIKI_SEARCH_URL=your_wiki_endpoint
+DOC_SEARCH_URL=your_doc_search_endpoint
+
+### Run the App
+uvicorn main:app --reload --port 8000
+Open: http://localhost:8000
+
+### Verify Installation
+pytest tests/ -v
+All tests must pass before proceeding to build.
+
+---
+
+## 1. BACKEND — DATABASE SETUP (db/)
+
+### database.py
+- SQLite via SQLAlchemy
+- Tables: users, tickets, agent_steps, resolutions
+- Create all tables on startup
+
+### chroma.py
+- Initialize ChromaDB persistent client
+- Point to CHROMA_PERSIST_DIR from .env
+- Create collection "resolved_incidents" if not exists
+- Export client and collection for use in rag_memory.py
+
+### Ticket Status Constants (models/ticket.py)
+STATUS_NEW = "New"
+STATUS_INVESTIGATING = "Investigating"
+STATUS_IN_REVIEW = "In Review"
+STATUS_PENDING_APPROVAL = "Pending Approval"
+STATUS_COMPLETE = "Complete"
+
+VALID_TRANSITIONS = {
+  "New": ["Investigating"],
+  "Investigating": ["In Review"],
+  "In Review": ["Pending Approval"],
+  "Pending Approval": ["Complete"]
+}
+
+Seed data on first run:
+- User: guest / guest123 (bcrypt hashed)
+- Tickets: AWTI-I-5001, 5002, 5003 (as below)
+
+---
+
+## 2. PAGE 1 — LOGIN (login.html + routers/auth.py)
+
+### Frontend (login.html)
+Full screen dark background.
+Centered card:
+- RapidRoot logo + "AI Incident Management" subtitle
+- Username input
+- Password input
+- [Sign In] button (green, full width)
+- Inline error message area
+
+### Backend (routers/auth.py)
+POST /api/auth/login
+  body: { username, password }
+  → validate against users table
+  → on success: return JWT token + user info
+  → on failure: return 401
+
+POST /api/auth/logout
+  → invalidate session
+
+GET /api/auth/me
+  → return current user from JWT
+
+### Frontend Auth Flow (auth.js)
+- On submit: POST to /api/auth/login
+- On success: store JWT in localStorage "rapidroot_token"
+- Redirect to dashboard.html
+- On failure: show inline error
+
+### Route Guard
+- Every page calls GET /api/auth/me on load
+- If 401 returned: redirect to login.html
+- If valid: populate header with user name and avatar
+- Logout: DELETE token, redirect to login.html
+- Token expires after 8 hours
+
+### auth.py Unit Tests (tests/test_auth.py)
+- POST /login with valid credentials returns 200 + token
+- POST /login with invalid credentials returns 401
+- POST /login with missing fields returns 422
+- GET /me with valid token returns user info
+- GET /me with expired token returns 401
+- GET /me with no token returns 401
+- POST /logout invalidates token
+- Password stored as bcrypt hash not plaintext
+- JWT contains correct user fields
+- Token expiry is exactly 8 hours
+
+---
+
+## 3. PAGE 2 — OVERVIEW DASHBOARD (dashboard.html + routers/metrics.py)
+
+### Backend (routers/metrics.py)
+GET /api/metrics
+  → return all stat card values calculated from tickets table:
+  {
+    totalApps, totalIncidents, activeTickets,
+    completedTickets, completedByAI, reqHumanAssistance,
+    aiHoursSaved, mttr, estimatedAnnualSavings,
+    incidentsByApp: { AHA, SVC_NOW, CLIENT_EMAIL },
+    severityByMonth: [...],
+    weeklyMTTR: [...],
+    weeklyAISaved: [...]
+  }
+
+GET /api/tickets
+  → return all tickets with current status
+
+### Frontend (dashboard.html + dashboard.js)
+Header:
+- RapidRoot logo, nav tabs, user avatar from session
+- "Welcome in, [name] 👋" from JWT user info
+- "AI-powered incident command center —
+   RapidRoot handles the investigation, you approve the action."
+
+Top controls:
+- Range: 3d / 1w / 1m / 3m / 6m / 1yr
+- Date FROM/TO pickers
+- App Type dropdown
+- Severity filter: All / L1 Lowest / L2 Medium / L3 Highest
+
+Stat cards row 1:
+- Total Monitored Applications
+- Total Incidents
+- Active Tickets (green border)
+
+Stat cards row 2:
+- Completed Tickets
+- Completed by AI (blue underline)
+- Req Human Assistance (orange dot)
+
+Charts:
+- Incident Activity by Application (bar: AHA/SVC NOW/CLIENT EMAIL)
+- Incident Severity Last 12 Months (line: L1/L2/L3)
+- Hours AI Saved vs MTTR Weekly (two lines: green solid / orange dashed)
+
+Active Incidents table:
+- Columns: Level | Ref # | Title | App Type | Submitted By | Status
+- Checkbox per row
+- [Start Agentic Investigation] button bottom right
+  - Disabled when 0 selected
+  - On click: PATCH /api/tickets/bulk-status { ids, status: "Investigating" }
+  - Navigate to investigation.html
+
+ROI Summary panel:
+- All values from GET /api/metrics
+- Recalculates on every ticket completion via WebSocket
+
+### WebSocket (main.py)
+WS /ws/dashboard
+- Server pushes updated metrics whenever any ticket status changes
+- Frontend listens and rerenders stat cards + table without reload
+
+### dashboard.py Unit Tests (tests/test_metrics.py)
+- GET /metrics returns all required fields
+- totalIncidents counts all tickets
+- activeTickets counts Investigating + In Review
+- completedByAI only counts AI-resolved tickets
+- reqHumanAssistance counts Pending Approval tickets
+- ROI formula: aiHoursSaved × (100000/2080) = estimatedAnnualSavings
+- incidentsByApp groups correctly by appType
+- Bulk status PATCH transitions all selected tickets
+- Bulk PATCH rejects invalid transitions
+- WebSocket pushes update on ticket status change
+
+---
+
+## 4. PAGE 3 — INCIDENTS TAB (incidents.html + routers/tickets.py)
+
+### Backend (routers/tickets.py)
+GET /api/tickets?status=X
+  → return tickets filtered by status
+
+PATCH /api/tickets/{id}/status
+  body: { status: "New|Investigating|In Review|Pending Approval|Complete" }
+  → validate transition against VALID_TRANSITIONS
+  → update DB
+  → broadcast WebSocket event to all connected clients
+
+GET /api/tickets/{id}
+  → return single ticket with all agentSteps
+
+### Frontend (incidents.html + incidents.js)
+Pipeline status bar:
+  [NEW: X] → [INVESTIGATING: X] → [IN REVIEW: X] → [COMPLETED: X]
+  Each stage clickable → filters table
+  Active stage has gold border
+  Counts from GET /api/tickets grouped by status
+
+Table:
+- Columns: checkbox | Level | Ref # | Title | App Type | Status badge | [Investigate →]
+- Status badges: New (gray) | Investigating (blue pulse) |
+  Pending Approval (gold) | Complete (green)
+- "X incidents · filtered: [Stage]" above table
+- [Investigate Selected] green button top right
+- Per-row [Investigate →] → navigate to investigation.html?ticket=AWTI-I-XXXX
+
+WebSocket /ws/incidents:
+- Listens for status change events
+- Rerenders pipeline counts and badges without reload
+
+### tickets.py Unit Tests (tests/test_tickets.py)
+- GET /tickets returns all 3 seed tickets
+- GET /tickets?status=New returns only New tickets
+- PATCH /tickets/{id}/status valid transition returns 200
+- PATCH /tickets/{id}/status invalid transition returns 400
+- PATCH /tickets/{id}/status updates DB correctly
+- PATCH broadcasts WebSocket event
+- GET /tickets/{id} returns ticket with agentSteps
+- Missing ticket returns 404
+- Unauthorized request returns 401
+
+---
+
+## 5. PAGE 4 — INVESTIGATION BOARD (investigation.html)
+
+### CRITICAL — This page was not working as intended.
+### Rebuild it completely according to this spec.
+
+### What Was Wrong (fix all of these):
+- Agent steps were not running sequentially — fix with proper async chain
+- Step outputs were not persisting to DB between steps — fix by writing
+  each step result to agent_steps table immediately on completion
+- Wiki search was not falling back to doc search on failure — fix in
+  wiki_search.py with proper try/except and fallback call
+- RAG memory search was not triggering on ticket load — fix by calling
+  GET /api/rag/search on page load before user clicks Investigate
+- Terminal animation was firing all at once instead of streaming —
+  fix terminal.js to use proper setTimeout chain not Promise.all
+- Parallel panes were sharing state causing collision — fix by scoping
+  each pane to its own agentFlow instance with unique paneId
+- Status was not syncing back to Page 2 and Page 3 after Send Report —
+  fix by ensuring PATCH /tickets/{id}/status is called and WebSocket
+  broadcasts after every step change not just final step
+- Final report was missing step outputs — fix reportBuilder.py to
+  fetch all agentSteps from DB before generating report
+
+### Layout
+Left sidebar:
+- "Agent Inbox" + [← Dashboard] button
+- [▶ Start All Investigations] green button
+- ACTIVE: X (green dot)
+- WAITING: X (yellow dot)
+  Lists: AWTI-I-5001 [BLK], AWTI-I-5002 [GPG], AWTI-I-5003 [BEN_A01]
+- COMPLETED: X (gray)
+- Clicking sidebar ticket loads into Pane A
+
+Main area:
+- "Parallel Investigation View" label
+- Focus / Parallel toggle top right
+
+Pane A (left 50%):
+- Dropdown to select ticket
+- 8 step cards render below on selection
+- Right detail panel shows active step output
+
+Pane B (right 50%):
+- Independent dropdown + independent step cards
+- Own detail panel
+- Focus mode: Pane B hidden, Pane A full width
+
+Bottom bar:
+- "Enter a custom issue description..." input
+- [Investigate] button
+
+### On Page Load
+1. Read ?ticket= param from URL (set by Page 3)
+2. Pre-select that ticket in Pane A
+3. Call GET /api/rag/search?q={problemStatement} silently
+4. If match found: show banner above step cards:
+   "💡 Similar incident found in memory — investigation may be faster"
+5. Populate sidebar WAITING with all non-complete tickets
+
+---
+
+## 6. AGENT FLOW — BACKEND (services/agent_flow.py)
+
+### POST /api/agent/start
+body: { ticketId, paneId }
+→ set ticket status → Investigating
+→ broadcast WebSocket status change
+→ return { flowId } to frontend
+→ frontend polls GET /api/agent/flow/{flowId} for step updates
+
+### Each Step — Async Sequential Execution
+Steps run one after another. Each step:
+1. Writes { stepNumber, name, status: "running", startedAt } to agent_steps table
+2. Executes its logic
+3. Writes { status: "done", output: {...}, duration } to agent_steps table
+4. Returns output to trigger next step
+
+Steps never run in parallel within one flow.
+On exception: write { status: "error", error: message } to agent_steps table.
+
+### GET /api/agent/flow/{flowId}
+→ return all agent_steps for this flow with current status + output
+Frontend polls this every 1s to update step cards UI
+
+### Step 1: Incident Analyzer
+- Input: ticket.title + ticket.description
+- Call AI model via anthropic client (use model from .env or config)
+- Prompt: extract { problemStatement, affectedSystem, severity, missingInfo[] }
+- Save output to agent_steps
+- After save: call rag_memory.search(problemStatement, topK=1, threshold=0.85)
+- If hit: attach ragMemoryHit to flow, return flag to frontend
+
+### Step 2: Problem Statement Finder
+- Input: Step 1 output
+- Call AI model
+- Generate 2-3 line summary
+- Save to agent_steps
+
+### Step 3: Wiki & Documentation Search
+- Call wiki_search.py (EXISTING — do not recreate)
+- Try wiki search first
+- On empty result OR any exception: catch it, log it, call doc_search()
+- Show which source was used in output: "wiki" or "docs_fallback"
+- Save top 3 results to agent_steps
+
+### Step 4: Historical Memory Search (RAG)
+- Call rag_memory.search(problemStatement, topK=3, threshold=0.65)
+- Evaluate similarity tiers:
+  > 0.85: highConfidence = true, offer fastTrack
+  0.65-0.85: partialMatch = true, prePopulateQueries = cached queries
+  < 0.65: noMatch = true
+- Save results + tier to agent_steps
+
+### Step 5: Query Generator
+- Input: ticket + step3 results + step4 results
+- Call AI model
+- Generate: 2 SQL queries + 1 log query
+- If partialMatch: include historical queries in prompt as starting point
+- Save generated queries to agent_steps
+
+### Step 6: SQL Executor
+- Input: SQL queries from Step 5
+- Call terminal_runner.py which returns mock structured data
+- Mock data matches ticket:
+  AWTI-I-5001: portfolio_allocations rows, rebalancing_jobs rows
+  AWTI-I-5002: allocation_weights rows, portfolio_calc_runs rows
+  AWTI-I-5003: fx_orders rows, account_setup_log rows
+- Return: { command, rows[], executionTime, rowCount }
+- Save to agent_steps
+
+### Step 7: Log Query Executor
+- Input: log query from Step 5
+- Call terminal_runner.py for mock log lines
+- Return: { command, logLines[], matchCount, executionTime }
+- logLines each have: { timestamp, level, service, message, isMatch }
+- Mock logs match ticket context
+- Save to agent_steps
+
+### Step 8: Final Answer Generator
+- Input: fetch ALL agent_steps from DB for this flowId
+- Call AI model with all outputs combined
+- Generate:
+  { rootCause, fixSteps[], confidenceScore }
+- Save to agent_steps
+- Set flow status: "awaiting_report"
+
+### agent_flow.py Unit Tests (tests/test_agent_flow.py)
+- POST /agent/start creates flow and sets status Investigating
+- Steps execute in order 1 to 8
+- Each step writes to agent_steps immediately on start
+- Each step updates agent_steps on completion
+- Step 1 triggers RAG search after saving output
+- Step 3 calls wiki_search first
+- Step 3 catches exception and calls doc_search fallback
+- Step 3 records source as "docs_fallback" when fallback used
+- Step 4 returns correct similarity tier per score range
+- Fast Track flag returned when score > 0.85
+- Step 5 includes historical queries when partialMatch true
+- Step 6 returns structured mock rows for correct ticket
+- Step 7 returns mock log lines with isMatch field
+- Step 8 fetches all steps from DB before generating answer
+- Step 8 output contains rootCause, fixSteps, confidenceScore
+- On exception: step status set to error with message
+- GET /agent/flow/{flowId} returns all steps with current status
+- Status change broadcasts WebSocket on every step completion
+
+---
+
+## 7. AGENT FLOW — FRONTEND (agentFlow.js)
+
+### Fixed Sequential Polling Pattern
+On [Investigate] click:
+1. POST /api/agent/start → get flowId
+2. Start polling GET /api/agent/flow/{flowId} every 1000ms
+3. On each poll: compare returned steps to rendered steps
+4. For each newly completed step: render its output card
+5. For running step: show pulse animation on its card
+6. Stop polling when all 8 steps done or error
+
+### Step Card Rendering
+Each step card:
+- Number circle + name
+- Status badge: pending (gray) / running (blue pulse) / done (green) / error (red)
+- Time taken shown after done
+- Output collapsed by default, click to expand
+- On error: [Retry] POST /api/agent/retry/{flowId}/{stepNumber}
+           [Skip]  POST /api/agent/skip/{flowId}/{stepNumber}
+
+### Pane Isolation (critical fix)
+Each pane has:
+- paneId: "pane-a" or "pane-b"
+- Own flowId
+- Own polling interval (clearInterval on pane reset)
+- Own step card container element
+- Zero shared variables between panes
+
+### Steps 6 & 7 — Terminal Animation (critical fix)
+When step 6 or 7 output received from poll:
+1. Instantiate new Terminal(detailPanelElement)
+2. Call term.run(output.command, output.rows or output.logLines)
+3. term.run uses setTimeout chain — NOT Promise.all — NOT forEach
+4. Each character typed with setTimeout(fn, charIndex * 50)
+5. Each output line added with setTimeout(fn, (totalChars * 50) + lineIndex * 80)
+6. Render HTML table ONLY after term.run() Promise resolves
+7. Highlight log lines where isMatch === true with amber CSS class
+
+### agentFlow.js Unit Tests (frontend — tests/test_investigation.py via httpx)
+- POST /agent/start called on Investigate click
+- Polling starts after flowId received
+- Polling stops when all steps complete
+- Polling stops on error step
+- Each pane has isolated flowId and interval
+- Resetting pane A does not affect pane B
+- Step card status updates match API response
+- Terminal instantiated only for steps 6 and 7
+- HTML table renders only after terminal animation completes
+- Retry calls correct endpoint with stepNumber
+- Skip calls correct endpoint with stepNumber
+
+---
+
+## 8. CLI TERMINAL COMPONENT (terminal.js — critical fix)
+
+### Fixed Implementation
+class Terminal {
+  constructor(container) {
+    this.container = container
+    this.build()
+  }
+
+  build() {
+    // Create terminal DOM structure
+    // Black background, green monospace font
+    // Header: "● AWT Investigation Terminal" + 3 dots
+    // Output area (scrollable div)
+    // Footer div
+  }
+
+  run(command, lines, highlightPattern = null) {
+    return new Promise((resolve) => {
+      this.clear()
+      this.typeCommand(command, () => {
+        this.showSpinner(() => {
+          this.streamLines(lines, highlightPattern, () => {
+            this.showFooter(lines.length)
+            resolve()
+          })
+        })
+      })
+    })
+  }
+
+  typeCommand(command, callback) {
+    // Use setTimeout chain — one char at a time — 50ms per char
+    let i = 0
+    const type = () => {
+      if (i < command.length) {
+        this.appendChar(command[i])
+        i++
+        setTimeout(type, 50)
+      } else {
+        callback()
+      }
+    }
+    type()
+  }
+
+  showSpinner(callback) {
+    // Show CSS spinner element
+    // setTimeout 1500ms then hide spinner and callback
+    setTimeout(() => {
+      this.hideSpinner()
+      callback()
+    }, 1500)
+  }
+
+  streamLines(lines, highlightPattern, callback) {
+    // Stream lines one at a time with setTimeout chain
+    let i = 0
+    const addLine = () => {
+      if (i < lines.length) {
+        const isMatch = highlightPattern &&
+          lines[i].includes(highlightPattern)
+        this.appendLine(lines[i], isMatch)
+        this.scrollToBottom()
+        i++
+        setTimeout(addLine, 80)
+      } else {
+        callback()
+      }
+    }
+    addLine()
+  }
+}
+
+### terminal.js Unit Tests (tests/test_terminal.py)
+- Terminal builds correct DOM structure in container
+- typeCommand fires one character per 50ms setTimeout
+- showSpinner appears after command finishes
+- showSpinner hides after 1500ms
+- streamLines fires one line per 80ms setTimeout
+- Lines with match get amber CSS class applied
+- scrollToBottom called after each line
+- Footer shows line count
+- run() returns Promise
+- Promise resolves only after all lines streamed
+- clear() removes all previous output before new run
+
+---
+
+## 9. FINAL REPORT (services/report_builder.py)
+
+### POST /api/agent/report/{flowId}
+- Fetch ALL agent_steps from DB for flowId (critical fix — was missing this)
+- Fetch ticket details
+- Build report document:
+  {
+    ticketId, title, level, appType, submittedBy, client,
+    problemStatement,      ← from step 1
+    rootCause,             ← from step 8
+    wikiSources,           ← from step 3
+    ragMatches,            ← from step 4
+    sqlQueriesRun,         ← from step 5
+    sqlFindings,           ← from step 6
+    logQueryRun,           ← from step 5
+    logFindings,           ← from step 7
+    fixSteps,              ← from step 8
+    confidenceScore,       ← from step 8
+    resolvedBy: "AI Agent",
+    generatedAt: ISO timestamp
+  }
+- Return report to frontend for display
+
+### POST /api/agent/send-report/{flowId}
+- Call report_builder to get report
+- PATCH ticket status → "Pending Approval"
+- Broadcast WebSocket to ALL connected pages
+- Call rag_memory.store(resolutionDoc) with full resolution
+- Return { success, storedInMemory: true }
+
+### report_builder.py Unit Tests (tests/test_agent_flow.py)
+- Report fetches all 8 step outputs from DB
+- Report fails if any step missing or errored
+- Report contains all required fields
+- send-report transitions ticket to Pending Approval
+- send-report broadcasts WebSocket event
+- send-report calls rag_memory.store
+- rag_memory.store not called if resolution incomplete
+
+---
+
+## 10. RAG MEMORY (services/rag_memory.py + routers/rag.py)
+
+### rag_memory.store(resolutionDoc)
+Document:
+{
+  ticketId, title, problemStatement, rootCause, affectedSystem,
+  sqlQueriesUsed[], logQueryUsed, sqlFindings, logFindings,
+  fixSteps[], wikiSourcesUsed[], confidenceScore,
+  resolvedAt, resolvedBy, tags[],
+  embeddingText: title + problemStatement + rootCause + tags joined
+}
+- Generate embedding from embeddingText using AI client
+- Store in ChromaDB "resolved_incidents" collection
+- Reject if ticketId already exists
+- Reject if any required field missing
+- Create collection if not exists
+
+### rag_memory.search(query, topK=3, threshold=0.65)
+- Embed query
+- Query ChromaDB
+- Return results above threshold sorted by score desc
+- Return [] on no match
+
+### GET /api/rag/search?q={query}
+→ calls rag_memory.search, returns results to frontend
+
+### POST /api/rag/store
+→ calls rag_memory.store, called by send-report internally
+
+### rag_memory.py Unit Tests (tests/test_rag_memory.py)
+- store() saves to resolved_incidents collection
+- store() generates embedding from correct fields
+- store() rejects duplicate ticketId
+- store() rejects incomplete document
+- store() creates collection if not exists
+- search() returns results above threshold
+- search() returns empty list when no match
+- search() sorts by score descending
+- search() respects topK
+- search() respects threshold
+- GET /rag/search returns results from ChromaDB
+- Results contain all required display fields
+
+---
+
+## 11. WEBSOCKET SYNC (main.py)
+
+### WebSocket Manager
+- Maintain active connections per page:
+  /ws/dashboard
+  /ws/incidents
+  /ws/investigation
+- On ticket status change: broadcast to ALL active connections
+- Each page's JS listener calls its own syncUIFromState()
+
+### Sync behavior per page:
+- dashboard.js: fetch GET /api/metrics, rerender cards + table + charts
+- incidents.js: fetch GET /api/tickets, rerender pipeline + badges
+- investigation.js: rerender sidebar counts + pane status headers
+
+### sync.test.js Unit Tests (tests/test_sync.py)
+- WebSocket connection established on page load
+- Status change on Page 4 broadcasts to all WS connections
+- Page 2 rerenders metrics on broadcast
+- Page 3 rerenders pipeline counts on broadcast
+- Page 4 sidebar updates on broadcast
+- Disconnected client removed from connection pool
+- Reconnection restores sync automatically
+- Multiple clients on same page all receive broadcast
+
+---
+
+## 12. BUILD ORDER
+
+Follow this exact sequence:
+
+Step 1:  pip install all dependencies, verify with pytest --collect-only
+Step 2:  db/database.py + db/chroma.py + seed data + verify DB created
+Step 3:  models/ (ticket, user, resolution) + test_tickets.py basic CRUD
+Step 4:  routers/auth.py + login.html/css/js + tests/test_auth.py
+Step 5:  routers/metrics.py + dashboard.html/css/js + tests/test_metrics.py
+Step 6:  routers/tickets.py + incidents.html/css/js + tests/test_tickets.py
+Step 7:  services/rag_memory.py + routers/rag.py + tests/test_rag_memory.py
+Step 8:  terminal.js (fix setTimeout chain) + tests/test_terminal.py
+Step 9:  services/agent_flow.py (all 8 steps) + tests/test_agent_flow.py
+Step 10: services/report_builder.py + send-report endpoint
+Step 11: investigation.html/css/js + agentFlow.js (fix pane isolation
+         + fix polling + fix terminal call) + tests/test_investigation.py
+Step 12: WebSocket manager + tests/test_sync.py
+Step 13: End-to-end smoke test:
+  - Login as guest → dashboard loads
+  - All 3 tickets visible on dashboard
+  - Select tickets → Start Agentic Investigation → Page 4 loads
+  - Pane A pre-selects AWTI-I-5001
+  - RAG banner shows if memory hit exists
+  - Click Investigate → all 8 steps run sequentially
+  - Step 6 shows terminal typing SQL then streaming table
+  - Step 7 shows terminal typing log query then streaming lines
+  - Step 8 shows root cause + confidence bar
+  - Generate Final Report → all step outputs present in report
+  - Send Report → status → Pending Approval
+  - Page 3 pipeline count updates without reload
+  - Page 2 stat cards update without reload
+  - RAG store toast appears: "✓ Stored in memory"
+  - Open second ticket in Pane B → runs independently
+  - Verify Pane A unaffected by Pane B investigation
+  - Logout → redirected to login
+
+---
+
+## DO NOT
+- Do not reference any specific AI model name in code or comments
+- Do not recreate wiki_search.py — use existing module
+- Do not allow invalid ticket status transitions
+- Do not store incomplete or errored resolutions in RAG
+- Do not use Promise.all or forEach for terminal animation
+- Do not share state variables between Pane A and Pane B
+- Do not generate the final report without fetching all 8 step
+  outputs from the database first
+- Do not skip the wiki fallback to doc search — it must be
+  wrapped in try/except with explicit fallback call
+- Do not commit .env file
+- Do not run agent steps in parallel within one flow
